@@ -115,7 +115,7 @@ class LoraLayer(BaseTunerLayer):
         # This code works for linear layers, override for other layer types
         if r <= 0:
             raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
-
+        
         self.r[adapter_name] = r
         self.lora_alpha[adapter_name] = lora_alpha
         if lora_dropout > 0.0:
@@ -141,9 +141,10 @@ class LoraLayer(BaseTunerLayer):
         elif isinstance(init_lora_weights, str) and init_lora_weights.lower() == "olora":
             with gather_params_ctx(self.get_base_layer().weight):
                 self.olora_init(adapter_name)
-        elif isinstance(init_lora_weights, str) and init_lora_weights.lower() == "dude":
+        elif isinstance(init_lora_weights, str) and init_lora_weights.lower() in ["dude", "dude_reverse", "dude_adaptive"]:
             with gather_params_ctx(self.get_base_layer().weight):
-                self.dude_init(adapter_name)
+                mode = "normal" if init_lora_weights.lower() == "dude" else "reverse" if init_lora_weights.lower() == "dude_reverse" else "adaptive"
+                self.dude_init(adapter_name, mode)
                 self._move_adapter_to_device_of_base_layer(adapter_name)
                 self.dora_init(adapter_name)
                 self.use_dora[adapter_name] = True
@@ -154,6 +155,7 @@ class LoraLayer(BaseTunerLayer):
                 self.loftq_init(adapter_name)
         elif init_lora_weights:
             self.reset_lora_parameters(adapter_name, init_lora_weights)
+
         # call this before dora_init
         self._move_adapter_to_device_of_base_layer(adapter_name)
 
@@ -311,7 +313,7 @@ class LoraLayer(BaseTunerLayer):
         )
         self.lora_magnitude_vector[adapter_name] = dora_layer
         
-    def dude_init(self, adapter_name):
+    def dude_init(self, adapter_name, mode):
         """Initialize using DuDe (Dual Decomposition) method combining PiSSA and DoRA."""
         weight = self.get_base_layer().weight
         dtype = weight.dtype
@@ -326,11 +328,22 @@ class LoraLayer(BaseTunerLayer):
         
         # Perform SVD for PiSSA initialization
         V, S, Uh = torch.linalg.svd(weight.data, full_matrices=False)
-        Vr = V[:, : self.r[adapter_name]]
-        Sr = S[: self.r[adapter_name]]
+        
+        # Select either largest or smallest singular values based on initialization type
+        r = self.r[adapter_name]
+        if mode == "reverse":
+            # For dude_reverse, use the smallest singular values
+            Vr = V[:, -r:]  # Last r columns
+            Sr = S[-r:]     # Last r singular values
+            Uhr = Uh[-r:]   # Last r rows
+        else:
+            # For regular dude, use the largest singular values (original behavior)
+            Vr = V[:, :r]   # First r columns
+            Sr = S[:r]      # First r singular values
+            Uhr = Uh[:r]    # First r rows
+        
         Sr = Sr * self.dude_scale_factor[adapter_name]  # Apply scale factor
         Sr /= self.scaling[adapter_name]
-        Uhr = Uh[: self.r[adapter_name]]
         
         # Initialize LoRA weights using PiSSA's approach
         sqrt_Sr = torch.sqrt(Sr)

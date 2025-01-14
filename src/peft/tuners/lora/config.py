@@ -102,7 +102,7 @@ class LoraConfig(PeftConfig):
             Otherwise, it will use the original default value of `lora_alpha/r`.
         modules_to_save (`List[str]`):
             List of modules apart from adapter layers to be set as trainable and saved in the final checkpoint.
-        init_lora_weights (`bool` | `Literal["gaussian", "eva", "olora", "pissa", "pissa_niter_[number of iters]", "loftq", "dude"]`):
+        init_lora_weights (`bool` | `Literal["gaussian", "eva", "olora", "pissa", "pissa_niter_[number of iters]", "loftq", "dude", "dude_reverse", "dude_adaptive"]`):
             How to initialize the weights of the adapter layers. Passing True (default) results in the default
             initialization from the reference implementation from Microsoft. Passing 'gaussian' results in Gaussian
             initialization scaled by the LoRA rank for linear and layers. Setting the initialization to False leads to
@@ -154,7 +154,7 @@ class LoraConfig(PeftConfig):
         runtime_config (`LoraRuntimeConfig`):
             Runtime configurations (which are not saved or restored).
         dude_scale_factor (`float`):
-            Scale factor for DuDe initialization. Controls the strength of the DuDe initialization.
+            Scale factor for DuDe initialization. Controls the strength of the PiSSA initialization when init_lora_weights='dude' or 'dude_reverse' or 'dude_adaptive'.
     """
 
     r: int = field(default=8, metadata={"help": "Lora attention dimension"})
@@ -198,7 +198,7 @@ class LoraConfig(PeftConfig):
             "the final layer `classifier/score` are randomly initialized and as such need to be trainable and saved."
         },
     )
-    init_lora_weights: bool | Literal["gaussian", "olora", "pissa", "pissa_niter_[number of iters]", "loftq", "dude"] = field(
+    init_lora_weights: bool | Literal["gaussian", "olora", "pissa", "pissa_niter_[number of iters]", "loftq", "dude", "dude_reverse", "dude_adaptive"] = field(
         default=True,
         metadata={
             "help": (
@@ -212,6 +212,8 @@ class LoraConfig(PeftConfig):
                 "where [number of iters] indicates the number of subspace iterations to perform fsvd, and must be a nonnegative integer."
                 "Pass `'loftq'` to use LoftQ initialization"
                 "Pass `'dude'` to use Dual Decomposition (DuDe) initialization, which combines PiSSA and DoRA."
+                "Pass `'dude_reverse'` to use DuDe initialization with smallest singular values instead of largest ones."
+                "Pass `'dude_adaptive'` to use DuDe initialization with adaptive R calculation based on parameter budget percentage."
             ),
         },
     )
@@ -298,7 +300,7 @@ class LoraConfig(PeftConfig):
     dude_scale_factor: float = field(
         default=1.0,
         metadata={
-            "help": "Scale factor for DuDe initialization. Controls the strength of the PiSSA initialization when init_lora_weights='dude'."
+            "help": "Scale factor for DuDe initialization. Controls the strength of the PiSSA initialization when init_lora_weights='dude' or 'dude_reverse' or 'dude_adaptive'."
         },
     )
     # Enables replicating layers in a model to expand it to a larger model.
@@ -336,7 +338,7 @@ class LoraConfig(PeftConfig):
     def __post_init__(self):
         self.peft_type = PeftType.LORA
         
-        if self.init_lora_weights == "dude":
+        if self.init_lora_weights in ["dude", "dude_reverse", "dude_adaptive"]:
             self.use_dora = True
             self.use_rslora = True  # Enable RSLoRA scaling for DuDe
             
