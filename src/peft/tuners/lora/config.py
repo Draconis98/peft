@@ -102,19 +102,21 @@ class LoraConfig(PeftConfig):
             Otherwise, it will use the original default value of `lora_alpha/r`.
         modules_to_save (`List[str]`):
             List of modules apart from adapter layers to be set as trainable and saved in the final checkpoint.
-        init_lora_weights (`bool` | `Literal["gaussian", "olora", "pissa", "pissa_niter_[number of iters]", "loftq"]`):
+        init_lora_weights (`bool` | `Literal["gaussian", "eva", "olora", "pissa", "pissa_niter_[number of iters]", "loftq", "dude"]`):
             How to initialize the weights of the adapter layers. Passing True (default) results in the default
             initialization from the reference implementation from Microsoft. Passing 'gaussian' results in Gaussian
             initialization scaled by the LoRA rank for linear and layers. Setting the initialization to False leads to
-            completely random initialization and is discouraged. Pass `'loftq'` to use LoftQ initialization. Pass
-            `'olora'` to use OLoRA initialization. Passing `'pissa'` results in the initialization of <a
-            href='https://arxiv.org/abs/2404.02948'>Principal Singular values and Singular vectors Adaptation
-            (PiSSA)</a>, which converges more rapidly than LoRA and ultimately achieves superior performance. Moreover,
-            PiSSA reduces the quantization error compared to QLoRA, leading to further enhancements. Passing
-            `'pissa_niter_[number of iters]'` initiates Fast-SVD-based PiSSA initialization, where `[number of iters]`
-            indicates the number of subspace iterations to perform FSVD, and must be a nonnegative integer. When
-            `[number of iters]` is set to 16, it can complete the initialization of a 7B model within seconds, and the
-            training effect is approximately equivalent to using SVD.
+            completely random initialization and is discouraged. Pass `'loftq'` to use LoftQ initialization. Passing
+            `'eva'` results in a data-driven initialization of <ahref='https://arxiv.org/abs/2410.07170' >Explained
+            Variance Adaptation</a>. EVA initalizes LoRA based on the SVD of layer input activations and achieves SOTA
+            performance due to its ability to adapt to the finetuning data. Pass `'olora'` to use OLoRA initialization.
+            Passing `'pissa'` results in the initialization of <ahref='https://arxiv.org/abs/2404.02948' >Principal
+            Singular values and Singular vectors Adaptation (PiSSA)</a>, which converges more rapidly than LoRA and
+            ultimately achieves superior performance. Moreover, PiSSA reduces the quantization error compared to QLoRA,
+            leading to further enhancements. Passing `'pissa_niter_[number of iters]'` initiates Fast-SVD-based PiSSA
+            initialization, where `[number of iters]` indicates the number of subspace iterations to perform FSVD, and
+            must be a nonnegative integer. When `[number of iters]` is set to 16, it can complete the initialization of
+            a 7B model within seconds, and the training effect is approximately equivalent to using SVD.
         layers_to_transform (`Union[List[int], int]`):
             The layer indices to transform. If a list of ints is passed, it will apply the adapter to the layer indices
             that are specified in this list. If a single integer is passed, it will apply the transformations on the
@@ -151,6 +153,8 @@ class LoraConfig(PeftConfig):
             all have separate LoRA adapters attached to them.
         runtime_config (`LoraRuntimeConfig`):
             Runtime configurations (which are not saved or restored).
+        dude_scale_factor (`float`):
+            Scale factor for DuDe initialization. Controls the strength of the DuDe initialization.
     """
 
     r: int = field(default=8, metadata={"help": "Lora attention dimension"})
@@ -194,7 +198,7 @@ class LoraConfig(PeftConfig):
             "the final layer `classifier/score` are randomly initialized and as such need to be trainable and saved."
         },
     )
-    init_lora_weights: bool | Literal["gaussian", "olora", "pissa", "pissa_niter_[number of iters]", "loftq"] = field(
+    init_lora_weights: bool | Literal["gaussian", "olora", "pissa", "pissa_niter_[number of iters]", "loftq", "dude"] = field(
         default=True,
         metadata={
             "help": (
@@ -207,6 +211,7 @@ class LoraConfig(PeftConfig):
                 "Passing `'pissa_niter_[number of iters]'` initiates Fast-SVD-based PiSSA initialization, "
                 "where [number of iters] indicates the number of subspace iterations to perform fsvd, and must be a nonnegative integer."
                 "Pass `'loftq'` to use LoftQ initialization"
+                "Pass `'dude'` to use Dual Decomposition (DuDe) initialization, which combines PiSSA and DoRA."
             ),
         },
     )
@@ -290,6 +295,12 @@ class LoraConfig(PeftConfig):
             )
         },
     )
+    dude_scale_factor: float = field(
+        default=1.0,
+        metadata={
+            "help": "Scale factor for DuDe initialization. Controls the strength of the PiSSA initialization when init_lora_weights='dude'."
+        },
+    )
     # Enables replicating layers in a model to expand it to a larger model.
     layer_replication: Optional[list[tuple[int, int]]] = field(
         default=None,
@@ -324,6 +335,11 @@ class LoraConfig(PeftConfig):
 
     def __post_init__(self):
         self.peft_type = PeftType.LORA
+        
+        if self.init_lora_weights == "dude":
+            self.use_dora = True
+            self.use_rslora = True  # Enable RSLoRA scaling for DuDe
+            
         self.target_modules = (
             set(self.target_modules) if isinstance(self.target_modules, list) else self.target_modules
         )

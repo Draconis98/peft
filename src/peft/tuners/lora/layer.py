@@ -53,7 +53,8 @@ class LoraLayer(BaseTunerLayer):
         self._disable_adapters = False
         self.merged_adapters = []
         self.use_dora: dict[str, bool] = {}
-        self.lora_magnitude_vector = torch.nn.ModuleDict()  # for DoRA
+        self.dude_scale_factor: dict[str, float] = {}
+        self.lora_magnitude_vector = torch.nn.ModuleDict()  # for DoRA/DuDe
         self._caches: dict[str, Any] = {}
         self.ephemeral_gpu_offload: bool = ephemeral_gpu_offload
         self.kwargs = kwargs
@@ -101,7 +102,15 @@ class LoraLayer(BaseTunerLayer):
         self.out_features = out_features
 
     def update_layer(
-        self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora, use_dora: bool = False
+        self,
+        adapter_name,
+        r,
+        lora_alpha,
+        lora_dropout,
+        init_lora_weights,
+        use_rslora,
+        use_dora,
+        dude_scale_factor: float = 1.0,
     ):
         # This code works for linear layers, override for other layer types
         if r <= 0:
@@ -122,6 +131,8 @@ class LoraLayer(BaseTunerLayer):
             self.scaling[adapter_name] = lora_alpha / math.sqrt(r)
         else:
             self.scaling[adapter_name] = lora_alpha / r
+            
+        self.dude_scale_factor[adapter_name] = dude_scale_factor
 
         # for inits that require access to the base weight, use gather_param_ctx so that the weight is gathered when using DeepSpeed
         if isinstance(init_lora_weights, str) and init_lora_weights.startswith("pissa"):
@@ -130,6 +141,14 @@ class LoraLayer(BaseTunerLayer):
         elif isinstance(init_lora_weights, str) and init_lora_weights.lower() == "olora":
             with gather_params_ctx(self.get_base_layer().weight):
                 self.olora_init(adapter_name)
+        elif isinstance(init_lora_weights, str) and init_lora_weights.lower() == "dude":
+            with gather_params_ctx(self.get_base_layer().weight):
+                self.dude_init(adapter_name)
+                self._move_adapter_to_device_of_base_layer(adapter_name)
+                self.dora_init(adapter_name)
+                self.use_dora[adapter_name] = True
+                self.set_adapter(self.active_adapters)
+                return
         elif init_lora_weights == "loftq":
             with gather_params_ctx(self.get_base_layer().weight):
                 self.loftq_init(adapter_name)
@@ -291,6 +310,41 @@ class LoraLayer(BaseTunerLayer):
             base_layer=self.get_base_layer(), lora_A=lora_A, lora_B=lora_B, scaling=scaling, place_on_cpu=place_on_cpu
         )
         self.lora_magnitude_vector[adapter_name] = dora_layer
+        
+    def dude_init(self, adapter_name):
+        """Initialize using DuDe (Dual Decomposition) method combining PiSSA and DoRA."""
+        weight = self.get_base_layer().weight
+        dtype = weight.dtype
+        if dtype not in [torch.float32, torch.float16, torch.bfloat16]:
+            raise TypeError(
+                "Please initialize DuDe under float32, float16, or bfloat16. "
+                "Subsequently, re-quantize the residual model to help minimize quantization errors."
+            )
+        
+        # Convert weight to float32 for better numerical stability
+        weight = transpose(weight.to(torch.float32), self.fan_in_fan_out)
+        
+        # Perform SVD for PiSSA initialization
+        V, S, Uh = torch.linalg.svd(weight.data, full_matrices=False)
+        Vr = V[:, : self.r[adapter_name]]
+        Sr = S[: self.r[adapter_name]]
+        Sr = Sr * self.dude_scale_factor[adapter_name]  # Apply scale factor
+        Sr /= self.scaling[adapter_name]
+        Uhr = Uh[: self.r[adapter_name]]
+        
+        # Initialize LoRA weights using PiSSA's approach
+        sqrt_Sr = torch.sqrt(Sr)
+        lora_A = torch.diag(sqrt_Sr) @ Uhr
+        lora_B = Vr @ torch.diag(sqrt_Sr)
+        
+        # Set the weights
+        self.lora_A[adapter_name].weight.data = lora_A.contiguous()
+        self.lora_B[adapter_name].weight.data = lora_B.contiguous()
+        
+        # Adjust the base weight to maintain initial weight unchanged (BA=0)
+        weight = weight.data - self.scaling[adapter_name] * lora_B @ lora_A
+        weight = transpose(weight.to(dtype), self.fan_in_fan_out)
+        self.get_base_layer().weight.data = weight
 
     def _cache_store(self, key: str, value: Any) -> None:
         self._caches[key] = value
