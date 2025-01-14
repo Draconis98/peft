@@ -331,6 +331,7 @@ class LoraLayer(BaseTunerLayer):
         
         # Select either largest or smallest singular values based on initialization type
         r = self.r[adapter_name]
+        # TODO: adaptive mode should be implemented here
         if mode == "reverse":
             # For dude_reverse, use the smallest singular values
             Vr = V[:, -r:]  # Last r columns
