@@ -268,8 +268,23 @@ class LoraModel(BaseTuner):
                     module.to(weight.device)
 
     def _mark_only_adapters_as_trainable(self, model: nn.Module) -> None:
+        init_lora_weights = getattr(self.peft_config[self.active_adapters[0]], "init_lora_weights", None)
+        
+        # Check if it's orthogonal initialization method
+        is_orth = isinstance(init_lora_weights, str) and init_lora_weights.split("_")[-1].endswith("orth")
+        is_lora_xs = isinstance(init_lora_weights, str) and init_lora_weights.startswith("lora_xs")
+        
         for n, p in model.named_parameters():
-            if self.prefix not in n:
+            if is_orth:
+                var_type = init_lora_weights.split("_")[-1]
+                if var_type.startswith("alpha") and (self.prefix not in n or self.prefix + "B" in n):
+                    p.requires_grad = False
+                elif var_type.startswith("beta") and (self.prefix not in n or self.prefix + "A" in n):
+                    p.requires_grad = False
+            elif is_lora_xs:
+                if self.prefix + "xs_R" not in n:
+                    p.requires_grad = False
+            elif self.prefix not in n:
                 p.requires_grad = False
 
         for active_adapter in self.active_adapters:

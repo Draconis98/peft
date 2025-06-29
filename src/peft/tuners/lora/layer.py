@@ -101,6 +101,7 @@ class LoraLayer(BaseTunerLayer):
         self.use_dora: dict[str, bool] = {}  # not actively used anymore after #2443, keep it for BC
         self.lora_bias: dict[str, bool] = {}
         self.lora_magnitude_vector = torch.nn.ModuleDict()  # for DoRA
+        self.lora_xs_R = nn.ParameterDict({})
         self._caches: dict[str, Any] = {}
         self.ephemeral_gpu_offload: bool = ephemeral_gpu_offload
         # flag to enable/disable casting of input to weight dtype during forward call
@@ -216,7 +217,7 @@ class LoraLayer(BaseTunerLayer):
 
         if use_rslora or \
             (isinstance(init_lora_weights, str) and \
-             (init_lora_weights.startswith("dude") or init_lora_weights.startswith("pissa_var_alpha"))):
+             (init_lora_weights.startswith("dude") or init_lora_weights.startswith("rsop"))):
             self.scaling[adapter_name] = lora_alpha / math.sqrt(r)
         else:
             self.scaling[adapter_name] = lora_alpha / r
@@ -230,6 +231,12 @@ class LoraLayer(BaseTunerLayer):
         elif isinstance(init_lora_weights, str) and init_lora_weights.startswith("dude"):
             with gather_params_ctx(self.get_base_layer().weight):
                 self.dude_init(adapter_name, init_lora_weights)
+        elif isinstance(init_lora_weights, str) and init_lora_weights.startswith("rsop"):
+            with gather_params_ctx(self.get_base_layer().weight):
+                self.rsop_init(adapter_name, init_lora_weights)
+        elif isinstance(init_lora_weights, str) and init_lora_weights.startswith("lora_xs"):
+            with gather_params_ctx(self.get_base_layer().weight):
+                self.lora_xs_init(adapter_name, init_lora_weights)
         elif isinstance(init_lora_weights, str) and init_lora_weights.startswith("corda"):
             with gather_params_ctx(self.get_base_layer().weight):
                 self.corda_init(adapter_name, init_lora_weights)
@@ -321,6 +328,26 @@ class LoraLayer(BaseTunerLayer):
             weight_tensor = weight_tensor.to(dtype)
             base_layer.weight.data = weight_tensor
 
+    def lora_xs_init(self, adapter_name, init_lora_weights):
+        weight = self.get_base_layer().weight
+        dtype = weight.dtype
+        if dtype not in [torch.float32, torch.float16, torch.bfloat16]:
+            raise TypeError(
+                "Please initialize LoRA-XS under float32, float16, or bfloat16. "
+                "Subsequently, re-quantize the residual model to help minimize quantization errors."
+            )
+        weight = transpose(weight.to(torch.float32), self.fan_in_fan_out)
+        U, S, V = torch.linalg.svd(weight.data, full_matrices=False)
+        U_r = U[:, : self.r[adapter_name]]
+        S_r = S[: self.r[adapter_name]]
+        V_r = V[:self.r[adapter_name], :]
+        # Initialize with normal distribution N(0, 10^-5)
+        self.lora_xs_R[adapter_name] = nn.Parameter(torch.normal(mean=0.0, std=1e-5, 
+                                                    size=(self.r[adapter_name], self.r[adapter_name]), 
+                                                    dtype=U_r.dtype, device=U_r.device))
+        self.lora_A[adapter_name].weight.data = V_r.contiguous()
+        self.lora_B[adapter_name].weight.data = U_r @ torch.diag(S_r)
+        
     def pissa_init(self, adapter_name, init_lora_weights):
         weight = self.get_base_layer().weight
         dtype = weight.dtype
@@ -350,17 +377,62 @@ class LoraLayer(BaseTunerLayer):
 
         if init_lora_weights.startswith("pissa_var_"):
             var_type = init_lora_weights.split("_")[-1]
-            if var_type == "alpha":
+            if var_type.startswith("alpha"):
                 lora_A = torch.diag(Sr) @ Uhr
                 lora_B = Vr.contiguous()
-            elif var_type == "beta":
+                # if var_type.endswith("orth"):
+                #     lora_B.requires_grad = False
+            elif var_type.startswith("beta"):
                 lora_A = Uhr
                 lora_B = Vr @ torch.diag(Sr)
+                # if var_type.endswith("orth"):
+                #     lora_A.requires_grad = False
             else:
                 raise ValueError(f"Unknown initialization {init_lora_weights=}")
         else:
             lora_A = torch.diag(torch.sqrt(Sr)) @ Uhr
             lora_B = Vr @ torch.diag(torch.sqrt(Sr))
+        self.lora_A[adapter_name].weight.data = lora_A
+        self.lora_B[adapter_name].weight.data = lora_B
+        weight = weight.data - self.scaling[adapter_name] * lora_B @ lora_A
+        weight = transpose(weight.to(dtype), self.fan_in_fan_out)
+        self.get_base_layer().weight.data = weight
+    
+    def rsop_init(self, adapter_name, init_lora_weights):
+        weight = self.get_base_layer().weight
+        dtype = weight.dtype
+        if dtype not in [torch.float32, torch.float16, torch.bfloat16]:
+            raise TypeError(
+                "Please initialize RSOP under float32, float16, or bfloat16. "
+                "Subsequently, re-quantize the residual model to help minimize quantization errors."
+            )
+        
+        weight = transpose(weight.to(torch.float32), self.fan_in_fan_out)
+
+        # USV^T = W <-> VSU^T = W^T, where W^T = weight.data in R^{out_channel, in_channel},
+        V, S, Uh = torch.linalg.svd(weight.data, full_matrices=False)
+        Vr = V[:, : self.r[adapter_name]]
+        Sr = S[: self.r[adapter_name]]
+        Sr /= self.scaling[adapter_name]
+        Uhr = Uh[: self.r[adapter_name]]
+
+        var_type = init_lora_weights.split("_")[-1]
+        if var_type.startswith("alpha"):
+            lora_A = torch.diag(Sr) @ Uhr
+            lora_B = Vr.contiguous()
+            # if var_type.endswith("orth"):
+            #     lora_B.requires_grad = False
+        elif var_type.startswith("beta"):
+            lora_A = Uhr
+            lora_B = Vr @ torch.diag(Sr)
+            # if var_type.endswith("orth"):
+            #     lora_A.requires_grad = False
+        elif var_type == "omega":
+            lora_A = torch.diag(torch.sqrt(Sr)) @ Uhr
+            lora_B = Vr @ torch.diag(torch.sqrt(Sr))
+        else:
+            raise ValueError(f"Unknown initialization {init_lora_weights=}")
+
         self.lora_A[adapter_name].weight.data = lora_A
         self.lora_B[adapter_name].weight.data = lora_B
         weight = weight.data - self.scaling[adapter_name] * lora_B @ lora_A
@@ -637,9 +709,7 @@ class Linear(nn.Module, LoraLayer):
     def resolve_lora_variant(self, *, use_dora: bool, **kwargs) -> Optional[LoraVariant]:
         if not use_dora:
             return None
-
         from .variants import DoraLinearVariant
-
         return DoraLinearVariant()
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
@@ -780,11 +850,15 @@ class Linear(nn.Module, LoraLayer):
 
                 lora_A = self.lora_A[active_adapter]
                 lora_B = self.lora_B[active_adapter]
+                lora_xs_R = self.lora_xs_R[active_adapter] if active_adapter in self.lora_xs_R.keys() else None
                 dropout = self.lora_dropout[active_adapter]
                 scaling = self.scaling[active_adapter]
                 x = self._cast_input_dtype(x, lora_A.weight.dtype)
                 if active_adapter not in self.lora_variant:  # vanilla LoRA
-                    result = result + lora_B(lora_A(dropout(x))) * scaling
+                    if lora_xs_R is not None:
+                        result = result + lora_B(lora_A(dropout(x)) @ lora_xs_R) * scaling
+                    else:
+                        result = result + lora_B(lora_A(dropout(x))) * scaling
                 else:
                     result = self.lora_variant[active_adapter].forward(
                         self,

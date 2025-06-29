@@ -95,6 +95,8 @@ from .tuners import (
     VBLoRAModel,
     VeraConfig,
     VeraModel,
+    OSoraConfig,
+    OSoraModel,
     XLoraConfig,
     XLoraModel,
     get_eva_state_dict,

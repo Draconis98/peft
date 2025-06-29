@@ -41,6 +41,7 @@ class PeftType(str, enum.Enum):
     - HRA
     - BONE
     - RANDLORA
+    - OSORA
     """
 
     PROMPT_TUNING = "PROMPT_TUNING"
@@ -66,6 +67,7 @@ class PeftType(str, enum.Enum):
     BONE = "BONE"
     RANDLORA = "RANDLORA"
     TRAINABLE_TOKENS = "TRAINABLE_TOKENS"
+    OSORA = "OSORA"
 
 
 class TaskType(str, enum.Enum):
